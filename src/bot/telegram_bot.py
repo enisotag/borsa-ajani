@@ -436,7 +436,13 @@ async def _send_portfolio_summary(
             )
         return "\n".join(lines)
 
-    report_text = await asyncio.to_thread(_compute)
+    try:
+        report_text = await asyncio.to_thread(_compute)
+    except Exception as exc:
+        logger.exception("Portföy özeti hazırlanırken hata: %s", exc)
+        await wait_msg.edit_text("❌ Portföy özeti hazırlanırken geçici bir hata oluştu. Lütfen tekrar dene.")
+        return
+
     try:
         await wait_msg.delete()
     except Exception:
@@ -470,7 +476,13 @@ async def _send_opportunities(
             limit=8,
         )
 
-    opps = await asyncio.to_thread(_scan)
+    try:
+        opps = await asyncio.to_thread(_scan)
+    except Exception as exc:
+        logger.exception("Fırsatlar taranırken hata: %s", exc)
+        await wait_msg.edit_text("❌ Fırsatlar taranırken geçici bir hata oluştu. Lütfen tekrar dene.")
+        return
+
     try:
         await wait_msg.delete()
     except Exception:
@@ -528,7 +540,13 @@ async def _send_latest_reports(
         target_syms = portfolio_syms + [s for s in settings.bist_universe if s not in portfolio_syms]
         return analyst_collector.fetch_latest_reports(symbols=target_syms[:12])
 
-    reports = await asyncio.to_thread(_fetch)
+    try:
+        reports = await asyncio.to_thread(_fetch)
+    except Exception as exc:
+        logger.exception("Son raporlar çekilirken hata: %s", exc)
+        await wait_msg.edit_text("❌ Raporlar çekilirken geçici bir hata oluştu. Lütfen tekrar dene.")
+        return
+
     try:
         await wait_msg.delete()
     except Exception:
@@ -570,14 +588,20 @@ async def _send_daily_summary(
     wait_msg = await context.bot.send_message(
         chat_id=chat_id, text="📊 Günlük BIST özet bülteni hazırlanıyor..."
     )
-    bulletin = await asyncio.to_thread(
-        build_daily_bulletin_text,
-        db,
-        market_collector,
-        analyst_collector,
-        commentator,
-        settings,
-    )
+    try:
+        bulletin = await asyncio.to_thread(
+            build_daily_bulletin_text,
+            db,
+            market_collector,
+            analyst_collector,
+            commentator,
+            settings,
+        )
+    except Exception as exc:
+        logger.exception("Günlük bülten hazırlanırken hata: %s", exc)
+        await wait_msg.edit_text("❌ Günlük bülten hazırlanırken geçici bir hata oluştu. Lütfen biraz sonra tekrar dene.")
+        return
+
     try:
         await wait_msg.delete()
     except Exception:

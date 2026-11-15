@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -136,30 +137,40 @@ def build_daily_bulletin_text(
     portfolio_items = db.list_portfolio_items()
     portfolio_symbols = {item.symbol for item in portfolio_items}
 
-    portfolio_evaluations: list[dict[str, Any]] = []
-    for p_item in portfolio_items:
+    def _eval_portfolio_item(p_item: PortfolioItem) -> dict[str, Any]:
         market = market_collector.get_snapshot(p_item.symbol, include_news=False)
         consensus = analyst_collector.get_consensus(
             p_item.symbol,
             current_price=market.current_price if market.current_price > 0 else None,
         )
-        portfolio_evaluations.append(
-            {
-                "portfolio": p_item,
-                "market": market,
-                "consensus": consensus,
-            }
-        )
+        return {
+            "portfolio": p_item,
+            "market": market,
+            "consensus": consensus,
+        }
+
+    portfolio_evaluations: list[dict[str, Any]] = []
+    if portfolio_items:
+        with ThreadPoolExecutor(max_workers=min(6, len(portfolio_items))) as pool:
+            portfolio_evaluations = list(pool.map(_eval_portfolio_item, portfolio_items))
 
     opportunities = analyst_collector.scan_opportunities(
         universe=settings.bist_universe,
         portfolio_symbols=portfolio_symbols,
         limit=5,
     )
-    target_symbols = list(portfolio_symbols) + [
-        s for s in settings.bist_universe if s not in portfolio_symbols
-    ]
-    new_reports = analyst_collector.fetch_latest_reports(symbols=target_symbols[:15])
+    new_reports: list[AnalystReport] = []
+    seen_ids: set[str] = set()
+    for opp in opportunities:
+        for rep in opp.recent_reports:
+            if rep.report_id not in seen_ids:
+                seen_ids.add(rep.report_id)
+                new_reports.append(rep)
+    if not new_reports:
+        target_symbols = list(portfolio_symbols) + [
+            s for s in settings.bist_universe if s not in portfolio_symbols
+        ]
+        new_reports = analyst_collector.fetch_latest_reports(symbols=target_symbols[:8])
 
     return commentator.generate_daily_bulletin(
         portfolio_evaluations=portfolio_evaluations,

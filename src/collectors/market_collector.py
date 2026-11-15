@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from typing import Optional
 from urllib.parse import quote_plus
 
@@ -162,8 +164,11 @@ def build_plain_valuation_comment(
 class MarketCollector:
     """Yahoo Finance, TradingView TA ve Google News RSS üzerinden BIST verilerini toplar."""
 
-    def __init__(self, timeout_seconds: float = 8.0) -> None:
+    def __init__(self, timeout_seconds: float = 6.0, cache_ttl_seconds: float = 600.0) -> None:
         self.timeout_seconds = timeout_seconds
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self._cache_lock = threading.Lock()
+        self._snapshot_cache: dict[tuple[str, bool], tuple[float, MarketSnapshot]] = {}
 
     @staticmethod
     def normalize_bist_symbol(symbol: str) -> str:
@@ -266,6 +271,14 @@ class MarketCollector:
     def get_snapshot(self, symbol: str, include_news: bool = True) -> MarketSnapshot:
         """Bir BIST hissesi için fiyat, çarpan, hazır teknik yorum ve haber özeti döner."""
         clean_symbol = self.normalize_bist_symbol(symbol)
+        now_ts = time.monotonic()
+        with self._cache_lock:
+            cached = self._snapshot_cache.get((clean_symbol, include_news))
+            if not cached and not include_news:
+                cached = self._snapshot_cache.get((clean_symbol, True))
+            if cached and (now_ts - cached[0]) < self.cache_ttl_seconds:
+                return cached[1]
+
         yf_symbol = f"{clean_symbol}.IS"
 
         current_price = 0.0
@@ -377,7 +390,7 @@ class MarketCollector:
         )
         news = self.fetch_recent_news(clean_symbol, company_name) if include_news else []
 
-        return MarketSnapshot(
+        snapshot = MarketSnapshot(
             symbol=clean_symbol,
             company_name=company_name,
             current_price=current_price,
@@ -399,6 +412,10 @@ class MarketCollector:
             plain_valuation_comment=plain_val,
             recent_news=news,
         )
+        if current_price > 0:
+            with self._cache_lock:
+                self._snapshot_cache[(clean_symbol, include_news)] = (time.monotonic(), snapshot)
+        return snapshot
 
     def get_price_history(self, symbol: str, period: str = "6mo") -> list[tuple[str, float]]:
         """Yahoo Finance üzerinden belirtilen dönem için (YYYY-MM-DD, kapanış) fiyat geçmişi döner."""

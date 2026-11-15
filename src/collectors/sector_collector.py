@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from zoneinfo import ZoneInfo
@@ -132,14 +133,21 @@ def compare_stocks(
     clean_symbols = _dedupe_symbols(symbols)
     items: list[dict[str, Any]] = []
 
-    for sym in clean_symbols:
+    def _fetch_one(sym: str) -> Optional[dict[str, Any]]:
         try:
             market, consensus = _fetch_market_and_consensus(
                 sym, market_collector=market_collector, analyst_collector=analyst_collector
             )
-            items.append({"symbol": sym, "market": market, "consensus": consensus})
+            return {"symbol": sym, "market": market, "consensus": consensus}
         except Exception as exc:
             logger.debug("Karşılaştırma için hisse verisi alınamadı (%s): %s", sym, exc)
+            return None
+
+    if clean_symbols:
+        with ThreadPoolExecutor(max_workers=min(4, len(clean_symbols))) as pool:
+            for item in pool.map(_fetch_one, clean_symbols):
+                if item is not None:
+                    items.append(item)
 
     if clean_symbols:
         sectors = [get_sector_and_peers(s)[0] for s in clean_symbols]
@@ -204,11 +212,11 @@ def get_golden_stocks(
     target_universe = _resolve_universe(universe, analyst_collector)
     scored: list[dict[str, Any]] = []
 
-    for sym in target_universe:
+    def _score_one(sym: str) -> Optional[dict[str, Any]]:
         try:
             consensus = analyst_collector.get_consensus(sym)
             if consensus.buy_count < 2:
-                continue
+                return None
 
             try:
                 market = market_collector.get_snapshot(sym, include_news=False)
@@ -220,16 +228,21 @@ def get_golden_stocks(
                 market = market.model_copy(update={"current_price": consensus.current_price})
 
             score = round((consensus.buy_count * 12) + consensus.upside_percent, 2)
-            scored.append(
-                {
-                    "symbol": sym,
-                    "market": market,
-                    "consensus": consensus,
-                    "score": score,
-                }
-            )
+            return {
+                "symbol": sym,
+                "market": market,
+                "consensus": consensus,
+                "score": score,
+            }
         except Exception as exc:
             logger.debug("Altın hisse taraması hatası (%s): %s", sym, exc)
+            return None
+
+    if target_universe:
+        with ThreadPoolExecutor(max_workers=min(8, len(target_universe))) as pool:
+            for item in pool.map(_score_one, target_universe):
+                if item is not None:
+                    scored.append(item)
 
     scored.sort(
         key=lambda item: (
@@ -255,21 +268,30 @@ def get_dividend_leaders(
     target_universe = _resolve_universe(universe, analyst_collector)
     candidates: list[tuple[str, MarketSnapshot]] = []
 
-    for sym in target_universe:
+    def _fetch_div_snapshot(sym: str) -> Optional[tuple[str, MarketSnapshot]]:
         try:
             market = market_collector.get_snapshot(sym, include_news=False)
             if market.dividend_yield_pct is not None and market.dividend_yield_pct > 0:
-                candidates.append((sym, market))
+                return (sym, market)
         except Exception as exc:
             logger.debug("Temettü liderleri taraması hatası (%s): %s", sym, exc)
+        return None
+
+    if target_universe:
+        with ThreadPoolExecutor(max_workers=min(8, len(target_universe))) as pool:
+            for pair in pool.map(_fetch_div_snapshot, target_universe):
+                if pair is not None:
+                    candidates.append(pair)
 
     candidates.sort(
         key=lambda pair: float(pair[1].dividend_yield_pct or 0.0),
         reverse=True,
     )
 
-    results: list[dict[str, Any]] = []
-    for sym, market in candidates[:limit]:
+    top_candidates = candidates[:limit]
+
+    def _enrich_dividend(pair: tuple[str, MarketSnapshot]) -> dict[str, Any]:
+        sym, market = pair
         try:
             consensus = analyst_collector.get_consensus(
                 sym,
@@ -282,15 +304,18 @@ def get_dividend_leaders(
         if market.current_price <= 0 and consensus.current_price > 0:
             market = market.model_copy(update={"current_price": consensus.current_price})
 
-        results.append(
-            {
-                "symbol": sym,
-                "market": market,
-                "consensus": consensus,
-                "dividend_yield_pct": market.dividend_yield_pct,
-            }
-        )
-    return results
+        return {
+            "symbol": sym,
+            "market": market,
+            "consensus": consensus,
+            "dividend_yield_pct": market.dividend_yield_pct,
+        }
+
+    if not top_candidates:
+        return []
+
+    with ThreadPoolExecutor(max_workers=min(6, len(top_candidates))) as pool:
+        return list(pool.map(_enrich_dividend, top_candidates))
 
 
 def check_portfolio_sharp_moves(

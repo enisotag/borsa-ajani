@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -73,54 +76,66 @@ class AnalystCollector:
     def __init__(
         self,
         settings: Optional[Settings] = None,
-        timeout_seconds: float = 8.0,
+        timeout_seconds: float = 6.0,
+        cache_ttl_seconds: float = 900.0,
     ) -> None:
         self.settings = settings or get_settings()
         self.timeout_seconds = timeout_seconds
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self._cache_lock = threading.Lock()
+        self._web_reports_cache: Optional[tuple[float, list[AnalystReport]]] = None
+        self._consensus_cache: dict[str, tuple[float, AnalystConsensus]] = {}
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
         return symbol.strip().upper().replace(".IS", "")
 
     def _fetch_web_target_reports(self, symbol: Optional[str] = None) -> list[AnalystReport]:
-        """Halka açık BIST hedef fiyat web sayfalarından aracı kurum raporlarını toplar."""
-        urls = [
-            "https://hedeffiyat.com.tr/",
-            "https://www.hisseonerileri.com/hedef-fiyatlar/",
-        ]
+        """Halka açık BIST hedef fiyat web sayfasından aracı kurum raporlarını önbellekli toplar."""
+        now_ts = time.monotonic()
+        cached_reports: Optional[list[AnalystReport]] = None
+        with self._cache_lock:
+            if (
+                self._web_reports_cache is not None
+                and (now_ts - self._web_reports_cache[0]) < self.cache_ttl_seconds
+            ):
+                cached_reports = self._web_reports_cache[1]
+
+        if cached_reports is None:
+            urls = ["https://hedeffiyat.com.tr/"]
+            reports: list[AnalystReport] = []
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                )
+            }
+
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                for url in urls:
+                    try:
+                        resp = client.get(url, headers=headers)
+                        if resp.status_code != 200:
+                            continue
+                        parsed_items = self._parse_html_target_tables(
+                            resp.text, source_url=url, target_symbol=None
+                        )
+                        if parsed_items:
+                            reports.extend(parsed_items)
+                    except Exception as exc:
+                        logger.debug("Web hedef fiyat sayfası okunamadı (%s): %s", url, exc)
+
+            unique: dict[str, AnalystReport] = {}
+            for report in reports:
+                unique[report.report_id] = report
+            cached_reports = list(unique.values())
+            with self._cache_lock:
+                self._web_reports_cache = (time.monotonic(), cached_reports)
+
         if symbol:
             clean_sym = self._normalize_symbol(symbol)
-            urls.insert(0, f"https://hedeffiyat.com.tr/hisse/{clean_sym.lower()}/")
-
-        reports: list[AnalystReport] = []
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            )
-        }
-
-        with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
-            for url in urls:
-                try:
-                    resp = client.get(url, headers=headers)
-                    if resp.status_code != 200:
-                        continue
-                    parsed_items = self._parse_html_target_tables(
-                        resp.text, source_url=url, target_symbol=symbol
-                    )
-                    if parsed_items:
-                        reports.extend(parsed_items)
-                        if symbol and len(reports) >= 3:
-                            break
-                except Exception as exc:
-                    logger.debug("Web hedef fiyat sayfası okunamadı (%s): %s", url, exc)
-
-        # Tekrarlanan raporları report_id üzerinden temizle
-        unique: dict[str, AnalystReport] = {}
-        for report in reports:
-            unique[report.report_id] = report
-        return list(unique.values())
+            return [r for r in cached_reports if r.symbol == clean_sym]
+        return list(cached_reports)
 
     def _parse_html_target_tables(
         self,
@@ -307,6 +322,24 @@ class AnalystCollector:
     ) -> AnalystConsensus:
         """Yerel web tabloları ve Yahoo Finance verilerini birleştirerek analist konsensüsü döner."""
         clean_sym = self._normalize_symbol(symbol)
+        now_ts = time.monotonic()
+        with self._cache_lock:
+            cached = self._consensus_cache.get(clean_sym)
+            if cached and (now_ts - cached[0]) < self.cache_ttl_seconds:
+                cached_cons = cached[1]
+                if current_price and current_price > 0 and cached_cons.avg_target_price > 0:
+                    new_upside = round(
+                        ((cached_cons.avg_target_price - current_price) / current_price) * 100,
+                        2,
+                    )
+                    return cached_cons.model_copy(
+                        update={
+                            "current_price": round(current_price, 2),
+                            "upside_percent": new_upside,
+                        }
+                    )
+                return cached_cons
+
         (
             yf_price,
             avg_tp,
@@ -356,7 +389,7 @@ class AnalystCollector:
             1 for r in enriched_web_reports if "model portföy" in r.institution.lower() or "model" in r.source.lower()
         )
 
-        return AnalystConsensus(
+        consensus = AnalystConsensus(
             symbol=clean_sym,
             current_price=round(price, 2),
             avg_target_price=round(avg_tp, 2),
@@ -370,6 +403,10 @@ class AnalystCollector:
             recent_reports=all_reports[:8],
             in_model_portfolios=in_model_portfolios,
         )
+        if consensus.current_price > 0 or consensus.avg_target_price > 0:
+            with self._cache_lock:
+                self._consensus_cache[clean_sym] = (time.monotonic(), consensus)
+        return consensus
 
     def should_notify_report(
         self, consensus: AnalystConsensus, is_in_portfolio: bool
@@ -386,17 +423,38 @@ class AnalystCollector:
         """Web hedef fiyat kaynaklarından ve gerekirse takip listesinden son raporları çeker."""
         reports = self._fetch_web_target_reports(symbol=None)
         if symbols:
-            allowed = {self._normalize_symbol(s) for s in symbols}
-            filtered = [r for r in reports if r.symbol in allowed]
+            allowed = [self._normalize_symbol(s) for s in symbols]
+            allowed_set = set(allowed)
+            filtered = [r for r in reports if r.symbol in allowed_set]
             if filtered:
                 return filtered
-            # Web kaynaklarından veri dönmezse ilk birkaç sembol için konsensüsten topla
+            # Web kaynaklarından veri dönmezse ilk birkaç sembol için konsensüsten paralel topla
             collected: list[AnalystReport] = []
-            for sym in list(allowed)[:10]:
-                consensus = self.get_consensus(sym)
-                collected.extend(consensus.recent_reports)
+            sample_symbols = allowed[:10]
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for cons in pool.map(self.get_consensus, sample_symbols):
+                    collected.extend(cons.recent_reports)
             return collected
         return reports
+
+    def _evaluate_opportunity(
+        self, clean_sym: str, owned_or_watched: set[str]
+    ) -> Optional[AnalystConsensus]:
+        try:
+            consensus = self.get_consensus(clean_sym)
+            if consensus.avg_target_price <= 0 or consensus.current_price <= 0:
+                return None
+            is_watched = clean_sym in owned_or_watched
+            if (
+                consensus.upside_percent >= self.settings.min_upside_percent
+                and consensus.buy_count >= self.settings.min_buy_count
+            ):
+                return consensus
+            if is_watched and consensus.upside_percent >= self.settings.min_upside_percent:
+                return consensus
+        except Exception as exc:
+            logger.debug("Fırsat taraması sırasında hata (%s): %s", clean_sym, exc)
+        return None
 
     def scan_opportunities(
         self,
@@ -404,28 +462,20 @@ class AnalystCollector:
         portfolio_symbols: Optional[set[str]] = None,
         limit: int = 8,
     ) -> list[AnalystConsensus]:
-        """BIST takip evreninde en az %35 potansiyelli ve çoklu AL tavsiyeli fırsatları tarar."""
-        target_universe = universe or self.settings.bist_universe
+        """BIST takip evreninde en az %35 potansiyelli ve çoklu AL tavsiyeli fırsatları paralel tarar."""
+        target_universe = [self._normalize_symbol(s) for s in (universe or self.settings.bist_universe)]
         owned_or_watched = {self._normalize_symbol(s) for s in (portfolio_symbols or set())}
 
         opportunities: list[AnalystConsensus] = []
-        for sym in target_universe:
-            clean_sym = self._normalize_symbol(sym)
-            try:
-                consensus = self.get_consensus(clean_sym)
-                if consensus.avg_target_price <= 0 or consensus.current_price <= 0:
-                    continue
-                is_watched = clean_sym in owned_or_watched
-                # Fırsat radarı: Enflasyon üstü potansiyel (>= %35) + Çoklu AL (>= 2)
-                if (
-                    consensus.upside_percent >= self.settings.min_upside_percent
-                    and consensus.buy_count >= self.settings.min_buy_count
-                ):
-                    opportunities.append(consensus)
-                elif is_watched and consensus.upside_percent >= self.settings.min_upside_percent:
-                    opportunities.append(consensus)
-            except Exception as exc:
-                logger.debug("Fırsat taraması sırasında hata (%s): %s", clean_sym, exc)
+        max_workers = min(8, max(1, len(target_universe)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = pool.map(
+                lambda sym: self._evaluate_opportunity(sym, owned_or_watched),
+                target_universe,
+            )
+            for item in results:
+                if item is not None:
+                    opportunities.append(item)
 
         opportunities.sort(key=lambda item: item.upside_percent, reverse=True)
         return opportunities[:limit]
