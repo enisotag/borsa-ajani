@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: borsa-ajani
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "7860"
+      - key: ENABLE_HEALTH_SERVER
+        value: "1"
+      - key: TZ
+        value: Europe/Istanbul
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

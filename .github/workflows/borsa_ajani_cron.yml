@@ -1,0 +1,50 @@
+name: Borsa Ajani Bulut Zamanlayicisi
+
+on:
+  schedule:
+    # Hafta ici her gun 15:30 UTC (Istanbul saati ile 18:30) gun sonu ozet bulteni
+    - cron: "30 15 * * 1-5"
+    # Hafta ici seans ici 09:30, 12:30, 14:30 UTC (12:30, 15:30, 17:30 TR) rapor taramasi
+    - cron: "30 9,12,14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Calistirma modu (summary veya scan)"
+        required: true
+        default: "summary"
+        type: choice
+        options:
+          - summary
+          - scan
+
+jobs:
+  run-borsa-ajani:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Bagimliliklari yukle
+        run: pip install -r requirements.txt
+
+      - name: Gun ici yeni analist raporu taramasi
+        if: github.event.inputs.mode == 'scan' || (github.event_name == 'schedule' && github.event.schedule != '30 15 * * 1-5')
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py --once-scan
+
+      - name: 18:30 Gunluk BIST ozet bulteni
+        if: github.event.inputs.mode == 'summary' || (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 1-5')
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py --once-summary

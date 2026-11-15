@@ -1,0 +1,11 @@
+services:
+  borsa-ajani:
+    build: .
+    container_name: borsa-ajani
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Europe/Istanbul
