@@ -2,6 +2,8 @@ name: Borsa Ajani Bulut Zamanlayicisi
 
 on:
   schedule:
+    # Hafta ici her gun 06:30 UTC (Istanbul saati ile 09:30) sabah acilis oncesi ozet bulteni
+    - cron: "30 6 * * 1-5"
     # Hafta ici her gun 15:30 UTC (Istanbul saati ile 18:30) gun sonu ozet bulteni
     - cron: "30 15 * * 1-5"
     # Hafta ici seans ici 09:30, 12:30, 14:30 UTC (12:30, 15:30, 17:30 TR) rapor taramasi
@@ -34,15 +36,15 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Gun ici yeni analist raporu taramasi
-        if: github.event.inputs.mode == 'scan' || (github.event_name == 'schedule' && github.event.schedule != '30 15 * * 1-5')
+        if: github.event.inputs.mode == 'scan' || (github.event_name == 'schedule' && github.event.schedule != '30 6 * * 1-5' && github.event.schedule != '30 15 * * 1-5')
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py --once-scan
 
-      - name: 18:30 Gunluk BIST ozet bulteni
-        if: github.event.inputs.mode == 'summary' || (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 1-5')
+      - name: 09:30 / 18:30 Gunluk BIST ozet bulteni
+        if: github.event.inputs.mode == 'summary' || (github.event_name == 'schedule' && (github.event.schedule == '30 6 * * 1-5' || github.event.schedule == '30 15 * * 1-5'))
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

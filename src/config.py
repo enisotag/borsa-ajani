@@ -36,6 +36,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("MIN_BUY_COUNT", "2"))
     )
     daily_report_time: str = field(default_factory=lambda: os.getenv("DAILY_REPORT_TIME", "18:30").strip())
+    morning_report_time: str = field(default_factory=lambda: os.getenv("MORNING_REPORT_TIME", "09:30").strip())
     scan_interval_minutes: int = field(
         default_factory=lambda: int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
     )

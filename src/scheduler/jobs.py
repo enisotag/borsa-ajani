@@ -1,4 +1,4 @@
-"""Gün içi rapor taraması, 18:30 günlük özet ve ortak hisse analiz iş akışları."""
+"""Gün içi rapor taraması, 09:30 / 18:30 günlük özet ve ortak hisse analiz iş akışları."""
 
 from __future__ import annotations
 
@@ -132,6 +132,7 @@ def build_daily_bulletin_text(
     analyst_collector: AnalystCollector,
     commentator: BorsaCommentator,
     settings: Settings,
+    session_label: Optional[str] = None,
 ) -> str:
     """Portföy/izleme listesi + BIST fırsat radarı + yeni raporlardan günlük bülten oluşturur."""
     portfolio_items = db.list_portfolio_items()
@@ -176,6 +177,7 @@ def build_daily_bulletin_text(
         portfolio_evaluations=portfolio_evaluations,
         opportunities=opportunities,
         new_reports=new_reports,
+        session_label=session_label,
     )
 
 
@@ -385,8 +387,12 @@ async def intraday_report_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Gün içi tarama görevi sırasında hata: %s", exc)
 
 
-async def daily_evening_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hafta içi akşam 18:30'da günlük BIST kapanış özet bültenini gönderir."""
+async def _run_scheduled_summary_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    session_label: str,
+    log_label: str,
+) -> None:
+    """Hafta içi planlı saatlerde (09:30 sabah / 18:30 akşam) günlük BIST özet bülteni gönderir."""
     settings: Settings = context.bot_data.get("settings") or get_settings()
     if not settings.has_valid_chat_id():
         return
@@ -408,7 +414,26 @@ async def daily_evening_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             analyst_collector,
             commentator,
             settings,
+            session_label,
         )
         await send_telegram_text(context.bot, settings.telegram_chat_id, bulletin)
     except Exception as exc:
-        logger.exception("Günlük akşam özeti gönderilirken hata: %s", exc)
+        logger.exception("%s gönderilirken hata: %s", log_label, exc)
+
+
+async def daily_morning_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hafta içi sabah 09:30'da günlük BIST açılış öncesi özet bültenini gönderir."""
+    await _run_scheduled_summary_job(
+        context,
+        session_label="morning",
+        log_label="Günlük sabah özeti",
+    )
+
+
+async def daily_evening_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hafta içi akşam 18:30'da günlük BIST kapanış özet bültenini gönderir."""
+    await _run_scheduled_summary_job(
+        context,
+        session_label="evening",
+        log_label="Günlük akşam özeti",
+    )

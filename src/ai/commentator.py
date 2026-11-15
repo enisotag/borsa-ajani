@@ -378,8 +378,9 @@ Lütfen bu verilere dayanarak, teknik analiz bilmeyen orta-uzun vadeli bir yatı
         portfolio_evaluations: list[dict[str, Any]],
         opportunities: list[AnalystConsensus],
         new_reports: list[AnalystReport],
+        session_label: Optional[str] = None,
     ) -> str:
-        """Akşam 18:30 günlük kapanış özet bültenini oluşturur."""
+        """Sabah (09:30) veya akşam (18:30) BIST günlük özet bültenini oluşturur."""
         portfolio_lines: list[str] = []
         total_cost = 0.0
         total_value = 0.0
@@ -425,7 +426,23 @@ Lütfen bu verilere dayanarak, teknik analiz bilmeyen orta-uzun vadeli bir yatı
         ]
         rep_summary = "\n".join(rep_lines) if rep_lines else "Bugün yeni düşen tekil rapor yok."
 
-        prompt = f"""Bugünün Borsa İstanbul (BIST) kapanış verileri aşağıdadır:
+        is_morning = (session_label or "").strip().lower() == "morning"
+        if is_morning:
+            header = "🌅 BIST Sabah Açılış Özet Bülteni (09:30)"
+            data_intro = "Borsa İstanbul (BIST) sabah seans açılışı (09:30) öncesi güncel veriler aşağıdadır:"
+            closing_request = (
+                "Lütfen yatırımcıya sabah kahvesiyle birlikte seans açılmadan önce 1 dakikada okuyabileceği, "
+                "sade, net ve karar odaklı bir Sabah BIST Özet Bülteni yaz."
+            )
+        else:
+            header = "📊 BIST Günlük Kapanış Bülteni"
+            data_intro = "Bugünün Borsa İstanbul (BIST) kapanış verileri aşağıdadır:"
+            closing_request = (
+                "Lütfen yatırımcıya akşam kahvesiyle birlikte 1 dakikada okuyabileceği, "
+                "sade, net ve karar odaklı bir Günlük BIST Bülteni yaz."
+            )
+
+        prompt = f"""{data_intro}
 
 [1. PORTFÖY VE İZLEME LİSTESİ]
 {portfolio_summary}
@@ -436,14 +453,14 @@ Lütfen bu verilere dayanarak, teknik analiz bilmeyen orta-uzun vadeli bir yatı
 [3. YENİ ARACI KURUM RAPORLARI]
 {rep_summary}
 
-Lütfen yatırımcıya akşam kahvesiyle birlikte 1 dakikada okuyabileceği, sade, net ve karar odaklı bir Günlük BIST Bülteni yaz."""
+{closing_request}"""
 
         ai_text = self._call_gemini(prompt_text=prompt, system_instruction=BULLETIN_SYSTEM_INSTRUCTION)
         if ai_text:
-            return f"📊 BIST Günlük Kapanış Bülteni\n\n{ai_text}"
+            return f"{header}\n\n{ai_text}"
 
         return (
-            "📊 BIST Günlük Kapanış Bülteni\n\n"
+            f"{header}\n\n"
             f"💼 Portföy ve İzleme Listen:\n{portfolio_summary}\n\n"
             f"🚀 Fırsat Radarı (>= %{self.settings.min_upside_percent:.0f} Potansiyel & Çoklu AL):\n{opp_summary}\n\n"
             f"📰 Yeni Aracı Kurum Raporları:\n{rep_summary}\n\n"

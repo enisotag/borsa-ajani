@@ -240,6 +240,22 @@ def test_commentator_fallback_and_gemini_interactions(tmp_path: Path) -> None:
     call_kwargs = mock_client.interactions.create.call_args.kwargs
     assert call_kwargs["model"] == "gemini-3.8-flash"
 
+    # 3) Sabah (09:30) ve akşam (18:30) günlük özet bülteni başlıkları
+    evals = [{"portfolio": portfolio_item, "market": market, "consensus": consensus}]
+    morning_bulletin = fallback_commentator.generate_daily_bulletin(
+        portfolio_evaluations=evals,
+        opportunities=[consensus],
+        new_reports=consensus.recent_reports,
+        session_label="morning",
+    )
+    assert "🌅 BIST Sabah Açılış Özet Bülteni (09:30)" in morning_bulletin
+    evening_bulletin = fallback_commentator.generate_daily_bulletin(
+        portfolio_evaluations=evals,
+        opportunities=[consensus],
+        new_reports=consensus.recent_reports,
+    )
+    assert "📊 BIST Günlük Kapanış Bülteni" in evening_bulletin
+
 
 def test_html_table_parser_and_alert_dedup(tmp_path: Path) -> None:
     """HTML hedef fiyat ayrıştırıcıyı, serbest metin hisse yakalayıcıyı ve alert akışını doğrular."""
@@ -771,8 +787,12 @@ def test_bot_routing_keyboards_handlers_and_application_wiring(tmp_path: Path) -
     assert len(app.handlers[0]) == 14
     assert app.job_queue is not None
     jobs = app.job_queue.jobs()
-    assert len(jobs) == 2
-    assert {j.name for j in jobs} == {"intraday_report_scan", "daily_evening_summary"}
+    assert len(jobs) == 3
+    assert {j.name for j in jobs} == {
+        "intraday_report_scan",
+        "daily_morning_summary",
+        "daily_evening_summary",
+    }
 
     # 4) Bot callback / fotoğraf OCR / Q&A entegrasyon testi
     db = DatabaseManager(tmp_path / "bot_flow.db")

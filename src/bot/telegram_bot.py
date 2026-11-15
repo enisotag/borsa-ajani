@@ -37,6 +37,7 @@ from src.scheduler.jobs import (
     analyze_stock,
     build_daily_bulletin_text,
     daily_evening_summary_job,
+    daily_morning_summary_job,
     intraday_report_scan_job,
     send_telegram_text,
 )
@@ -253,7 +254,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/temettu` → En yüksek temettü verimine sahip BIST liderleri\n"
         "• `/kiyasla THYAO PGSUS` → Seçtiğin hisseleri yan yana kıyaslar ve yorumlar\n"
         "• `/raporlar` → Son aracı kurum hedef fiyat raporlarını listeler\n"
-        "• `/ozet` → Günlük kapanış bültenini hemen hazırlar"
+        "• `/ozet` → Günlük özet bültenini hemen hazırlar (otomatik: 09:30 & 18:30)"
     )
     await send_telegram_text(
         context.bot, chat_id, welcome_text, reply_markup=_main_menu_keyboard()
@@ -1302,12 +1303,14 @@ async def handle_free_text(
         )
 
 
-def _parse_report_time(time_str: str) -> dt_time:
+def _parse_report_time(
+    time_str: str, default_hour: int = 18, default_minute: int = 30
+) -> dt_time:
     try:
         hour_str, min_str = time_str.strip().split(":", 1)
         return dt_time(hour=int(hour_str), minute=int(min_str))
     except Exception:
-        return dt_time(hour=18, minute=30)
+        return dt_time(hour=default_hour, minute=default_minute)
 
 
 def build_application(settings: Optional[Settings] = None) -> Application:
@@ -1347,7 +1350,13 @@ def build_application(settings: Optional[Settings] = None) -> Application:
 
     if app.job_queue is not None:
         tz = ZoneInfo(active_settings.timezone)
-        report_t = _parse_report_time(active_settings.daily_report_time)
+        morning_t = _parse_report_time(
+            active_settings.morning_report_time, default_hour=9, default_minute=30
+        )
+        morning_time = dt_time(hour=morning_t.hour, minute=morning_t.minute, tzinfo=tz)
+        report_t = _parse_report_time(
+            active_settings.daily_report_time, default_hour=18, default_minute=30
+        )
         daily_time = dt_time(hour=report_t.hour, minute=report_t.minute, tzinfo=tz)
 
         app.job_queue.run_repeating(
@@ -1355,6 +1364,11 @@ def build_application(settings: Optional[Settings] = None) -> Application:
             interval=max(5, active_settings.scan_interval_minutes) * 60,
             first=45,
             name="intraday_report_scan",
+        )
+        app.job_queue.run_daily(
+            daily_morning_summary_job,
+            time=morning_time,
+            name="daily_morning_summary",
         )
         app.job_queue.run_daily(
             daily_evening_summary_job,
