@@ -7,8 +7,10 @@ import json
 import logging
 import math
 import re
+import time
 from typing import Any, Optional
 
+import httpx
 from google import genai
 
 from src.config import Settings, get_settings
@@ -150,21 +152,111 @@ class BorsaCommentator:
             except Exception as exc:
                 logger.warning("Gemini istemcisi başlatılamadı: %s", exc)
 
-    def _call_gemini(self, prompt_text: str, system_instruction: str) -> Optional[str]:
-        """Güncel google-genai Interactions API ile Gemini 3.8 Flash modelini çağırır."""
+    @staticmethod
+    def _is_transient_gemini_error(exc: Exception) -> bool:
+        """Geçici 503/504/yoğunluk hatalarını tespit eder."""
+        msg = str(exc).lower()
+        return any(
+            cue in msg
+            for cue in ("503", "504", "unavailable", "timeout", "deadline", "overloaded", "try again")
+        )
+
+    def _get_gemini_model_chain(self) -> list[str]:
+        """Ana Gemini modelini ve yedek modelleri sırayla, tekrarsız döndürür."""
+        raw_fallbacks = getattr(self.settings, "gemini_fallback_models", "") or ""
+        candidates = [self.settings.gemini_model] + [
+            m.strip() for m in str(raw_fallbacks).split(",") if m.strip()
+        ]
+        chain: list[str] = []
+        for model_name in candidates:
+            if model_name and model_name not in chain:
+                chain.append(model_name)
+        return chain or ["gemini-3.8-flash"]
+
+    def _run_gemini_interaction(
+        self, input_payload: Any, system_instruction: str
+    ) -> Optional[str]:
+        """Gemini model zincirini 503/504 geçici hata tekrar denemesiyle çalıştırır."""
         if self._client is None:
             return None
-        try:
-            interaction = self._client.interactions.create(
-                model=self.settings.gemini_model,
-                system_instruction=system_instruction,
-                input=prompt_text,
-            )
-            text = (interaction.output_text or "").strip()
-            return text or None
-        except Exception as exc:
-            logger.warning("Gemini API çağrısı başarısız, yedek şablon kullanılacak: %s", exc)
+        model_chain = self._get_gemini_model_chain()
+        for idx, model_name in enumerate(model_chain):
+            max_attempts = 2 if idx == 0 else 1
+            for attempt in range(max_attempts):
+                try:
+                    interaction = self._client.interactions.create(
+                        model=model_name,
+                        system_instruction=system_instruction,
+                        input=input_payload,
+                    )
+                    raw_output = getattr(interaction, "output_text", None)
+                    text = raw_output.strip() if isinstance(raw_output, str) else ""
+                    if text:
+                        return text
+                    break
+                except Exception as exc:
+                    is_transient = self._is_transient_gemini_error(exc)
+                    logger.warning(
+                        "Gemini (%s, deneme %d/%d) başarısız: %s",
+                        model_name,
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                    )
+                    if idx == 0 and attempt == 0 and is_transient:
+                        time.sleep(0.8)
+                        continue
+                    break
+        return None
+
+    def _call_groq(self, prompt_text: str, system_instruction: str) -> Optional[str]:
+        """Gemini yanıt veremediğinde yedek olarak ücretsiz Groq API'yi çağırır."""
+        if not hasattr(self.settings, "has_valid_groq_key") or not self.settings.has_valid_groq_key():
             return None
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.settings.groq_api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.settings.groq_model,
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt_text},
+                ],
+                "temperature": 0.4,
+            }
+            with httpx.Client(timeout=12.0) as client:
+                resp = client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            choices = data.get("choices") or []
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                text = content.strip() if isinstance(content, str) else ""
+                return text or None
+        except Exception as exc:
+            logger.warning("Groq yedek LLM çağrısı başarısız: %s", exc)
+        return None
+
+    def _call_gemini(self, prompt_text: str, system_instruction: str) -> Optional[str]:
+        """Güncel Gemini model zincirini, başarısız olursa Groq yedeğini çağırır."""
+        ai_text = self._run_gemini_interaction(
+            input_payload=prompt_text,
+            system_instruction=system_instruction,
+        )
+        if ai_text:
+            return ai_text
+
+        groq_text = self._call_groq(prompt_text=prompt_text, system_instruction=system_instruction)
+        if groq_text:
+            return groq_text
+
+        return None
 
     @staticmethod
     def _build_portfolio_context(
@@ -758,16 +850,13 @@ Lütfen soruyu yukarıdaki gerçek portföy ve BIST fırsat verilerine dayanarak
         )
 
         try:
-            interaction = self._client.interactions.create(
-                model=self.settings.gemini_model,
-                system_instruction=PORTFOLIO_OCR_SYSTEM_INSTRUCTION,
-                input=[
+            raw_text = self._run_gemini_interaction(
+                input_payload=[
                     {"type": "image", "data": base64_str, "mime_type": clean_mime},
                     {"type": "text", "text": prompt},
                 ],
+                system_instruction=PORTFOLIO_OCR_SYSTEM_INSTRUCTION,
             )
-            raw_output = getattr(interaction, "output_text", None)
-            raw_text = raw_output.strip() if isinstance(raw_output, str) else ""
             if not raw_text:
                 return []
 

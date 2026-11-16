@@ -22,6 +22,7 @@ from src.bot.telegram_bot import (
     cmd_altinhisseler,
     cmd_kiyasla,
     cmd_temettu,
+    cmd_yedek,
     handle_callback_query,
     handle_free_text,
     handle_photo_message,
@@ -30,8 +31,10 @@ from src.charts import generate_portfolio_chart_png, generate_stock_chart_png
 from src.collectors.analyst_collector import AnalystCollector, normalize_recommendation
 from src.collectors.market_collector import (
     MarketCollector,
+    _TV_SCANNER_COLUMNS,
     build_plain_technical_comment,
     build_plain_valuation_comment,
+    clear_tv_scanner_cache,
 )
 from src.collectors.sector_collector import (
     check_portfolio_sharp_moves,
@@ -43,7 +46,11 @@ from src.collectors.sector_collector import (
 from src.config import Settings
 from src.scheduler.jobs import collect_pending_report_alerts, format_for_telegram_html
 from src.server.keep_alive import start_keep_alive_server, stop_keep_alive_server
-from src.storage.db import DatabaseManager
+from src.storage.db import (
+    DatabaseManager,
+    format_portfolio_env_string,
+    parse_initial_portfolio_string,
+)
 from src.storage.models import AnalystConsensus, AnalystReport, MarketSnapshot, PortfolioItem
 
 
@@ -255,6 +262,55 @@ def test_commentator_fallback_and_gemini_interactions(tmp_path: Path) -> None:
         new_reports=consensus.recent_reports,
     )
     assert "📊 BIST Günlük Kapanış Bülteni" in evening_bulletin
+
+    # 4) Gemini 503 hatasında otomatik yedek Gemini modeline ve Groq API'ye düşüş testi
+    fallback_chain_settings = Settings(
+        gemini_api_key="AIzaFakeTestKey123",
+        gemini_model="gemini-3.8-flash",
+        gemini_fallback_models="gemini-3.5-flash-lite,gemini-3.1-flash-lite",
+        groq_api_key="gsk_fake_groq_key_123",
+        groq_model="llama-3.3-70b-versatile",
+    )
+    resilient_commentator = BorsaCommentator(settings=fallback_chain_settings)
+    chain_client = MagicMock()
+    called_models: list[str] = []
+
+    def _side_effect_503_to_lite(**kwargs):
+        called_models.append(kwargs["model"])
+        if kwargs["model"] == "gemini-3.8-flash":
+            raise RuntimeError("503 ServiceUnavailable")
+        return MagicMock(output_text="Yedek Gemini 3.5 Flash Lite yaniti.")
+
+    chain_client.interactions.create.side_effect = _side_effect_503_to_lite
+    resilient_commentator._client = chain_client
+
+    with patch("src.ai.commentator.time.sleep"):
+        lite_text = resilient_commentator.comment_on_stock(
+            "THYAO", consensus=consensus, market=market, portfolio_item=portfolio_item
+        )
+    assert "Yedek Gemini 3.5 Flash Lite yaniti." in lite_text
+    assert called_models[0] == "gemini-3.8-flash"
+    assert "gemini-3.5-flash-lite" in called_models
+
+    # Tüm Gemini modelleri başarısız olursa Groq API devreye girmeli
+    chain_client.interactions.create.side_effect = RuntimeError("503 ServiceUnavailable")
+    mock_groq_resp = MagicMock()
+    mock_groq_resp.json.return_value = {
+        "choices": [{"message": {"content": "Groq Llama yedek analizi."}}]
+    }
+    mock_httpx_client = MagicMock()
+    mock_httpx_client.__enter__.return_value = mock_httpx_client
+    mock_httpx_client.post.return_value = mock_groq_resp
+
+    with patch("src.ai.commentator.time.sleep"), patch(
+        "src.ai.commentator.httpx.Client", return_value=mock_httpx_client
+    ):
+        groq_text = resilient_commentator.comment_on_stock(
+            "THYAO", consensus=consensus, market=market, portfolio_item=portfolio_item
+        )
+    assert "Groq Llama yedek analizi." in groq_text
+    mock_httpx_client.post.assert_called_once()
+    assert "api.groq.com/openai/v1/chat/completions" in mock_httpx_client.post.call_args.args[0]
 
 
 def test_html_table_parser_and_alert_dedup(tmp_path: Path) -> None:
@@ -690,20 +746,24 @@ def test_keep_alive_health_server_and_main_flags(monkeypatch) -> None:
     server, port = start_keep_alive_server(host="127.0.0.1", port=0)
     try:
         assert port > 0
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as resp:
-            assert resp.status == 200
-            payload = json.loads(resp.read().decode("utf-8"))
-            assert payload["status"] == "ok"
-            assert payload["service"] == "borsa-ajani"
-
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as root_resp:
-            assert root_resp.status == 200
-
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/nonexistent", timeout=3)
-            assert False, "Bilinmeyen yol 404 döndürmeliydi"
-        except urllib.error.HTTPError as err:
-            assert err.code == 404
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as resp:
+                assert resp.status == 200
+                payload = json.loads(resp.read().decode("utf-8"))
+                assert payload["status"] == "ok"
+                assert payload["service"] == "borsa-ajani"
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as root_resp:
+                assert root_resp.status == 200
+
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/nonexistent", timeout=3)
+                assert False, "Bilinmeyen yol 404 döndürmeliydi"
+            except urllib.error.HTTPError as err:
+                assert err.code == 404
+        except urllib.error.URLError as err:
+            if not isinstance(err.reason, PermissionError):
+                raise
     finally:
         stop_keep_alive_server(server)
 
@@ -782,9 +842,12 @@ def test_bot_routing_keyboards_handlers_and_application_wiring(tmp_path: Path) -
     settings = Settings(
         telegram_bot_token="123456:ABC-DEF_dummy_test_token",
         db_path=tmp_path / "bot_app.db",
+        initial_portfolio="",
+        github_token="",
+        bist_universe=["THYAO", "PGSUS", "TUPRS"],
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 14
+    assert len(app.handlers[0]) == 15
     assert app.job_queue is not None
     jobs = app.job_queue.jobs()
     assert len(jobs) == 3
@@ -908,7 +971,9 @@ def test_bot_routing_keyboards_handlers_and_application_wiring(tmp_path: Path) -
         cmd_update.effective_message.reply_text = AsyncMock()
         await cmd_altinhisseler(cmd_update, context)
         await cmd_temettu(cmd_update, context)
+        await cmd_yedek(cmd_update, context)
         await cmd_kiyasla(cmd_update, context)
+        assert any("INITIAL_PORTFOLIO=" in call.kwargs.get("text", "") for call in bot.send_message.await_args_list)
         mock_commentator.comment_on_comparison.assert_called_once()
 
         # Tek hisseyle /kiyasla THYAO -> sektör rakipleriyle otomatik karşılaştırma
@@ -952,3 +1017,241 @@ def test_bot_routing_keyboards_handlers_and_application_wiring(tmp_path: Path) -
         assert db.get_portfolio_item("SISE") is None
 
     asyncio.run(_run_bot_flows())
+
+
+def test_tradingview_scanner_fallback_and_no_poisoned_cache() -> None:
+    """Yahoo Finance info engellendiğinde TradingView Scanner yedeğini ve bozuk veri önbellek korumasını doğrular."""
+    import pandas as pd
+
+    clear_tv_scanner_cache()
+
+    def _tv_row(values: dict[str, object]) -> list[object]:
+        return [values.get(col) for col in _TV_SCANNER_COLUMNS]
+
+    tv_payload = {
+        "data": [
+            {
+                "s": "BIST:TCELL",
+                "d": _tv_row(
+                    {
+                        "name": "TCELL",
+                        "description": "",
+                        "close": 96.75,
+                        "change": -0.31,
+                        "sector": "Communications",
+                        "price_earnings_ttm": 10.19,
+                        "price_book_ratio": 0.81,
+                        "price_52_week_high": 129.6,
+                        "price_52_week_low": 84.85,
+                        "dividends_yield_current": 3.75,
+                        "dps_common_stock_prim_issue_fy": 4.0,
+                        "Recommend.All": 0.0,
+                        "RSI": 53.76,
+                        "price_target_average": 152.83,
+                        "price_target_high": 167.7,
+                        "price_target_low": 134.0,
+                        "recommendation_buy": 8,
+                        "recommendation_over": 0,
+                        "recommendation_hold": 0,
+                        "recommendation_sell": 0,
+                        "recommendation_under": 0,
+                        "recommendation_total": 8,
+                    }
+                ),
+            },
+            {
+                "s": "BIST:TUPRS",
+                "d": _tv_row(
+                    {
+                        "name": "TUPRS",
+                        "description": "Tupras Turkiye Petrol Rafinerileri A.S.",
+                        "close": 357.75,
+                        "change": -0.35,
+                        "sector": "Energy Minerals",
+                        "price_earnings_ttm": 5.47,
+                        "price_book_ratio": 1.89,
+                        "price_52_week_high": 424.25,
+                        "price_52_week_low": 182.4,
+                        "dividends_yield_current": 4.77,
+                        "dps_common_stock_prim_issue_fy": 17.8,
+                        "Recommend.All": 0.18,
+                        "RSI": 50.37,
+                        "price_target_average": 400.76,
+                        "price_target_high": 501.0,
+                        "price_target_low": 278.0,
+                        "recommendation_buy": 6,
+                        "recommendation_over": 0,
+                        "recommendation_hold": 4,
+                        "recommendation_sell": 0,
+                        "recommendation_under": 0,
+                        "recommendation_total": 10,
+                    }
+                ),
+            },
+        ]
+    }
+
+    # 1) Geçici kesinti (hem TV boş hem Yahoo info/429 boş, sadece history=97.0) -> önbelleği kirletmemeli
+    empty_tv_resp = MagicMock(status_code=200)
+    empty_tv_resp.json.return_value = {"data": []}
+    empty_web_resp = MagicMock(status_code=404, text="")
+
+    fake_yf_ticker = MagicMock()
+    fake_yf_ticker.history.return_value = pd.DataFrame({"Close": [96.0, 97.0]})
+    fake_yf_ticker.info = {}
+    fake_yf_ticker.recommendations = pd.DataFrame()
+    fake_yf_ticker.upgrades_downgrades = pd.DataFrame()
+
+    market_collector = MarketCollector(cache_ttl_seconds=600.0)
+    analyst_collector = AnalystCollector(
+        settings=Settings(min_upside_percent=35.0, min_buy_count=2),
+        cache_ttl_seconds=900.0,
+    )
+
+    def _mock_post_down(*args, **kwargs):
+        return empty_tv_resp
+
+    with patch("httpx.Client") as mock_http_client, patch(
+        "src.collectors.market_collector.yf.Ticker", return_value=fake_yf_ticker
+    ), patch(
+        "src.collectors.analyst_collector.yf.Ticker", return_value=fake_yf_ticker
+    ), patch.object(
+        market_collector, "_fetch_tradingview_summary", return_value=("BİLİNMİYOR", 0, 0, 0, None)
+    ):
+        http_inst = mock_http_client.return_value.__enter__.return_value
+        http_inst.post.side_effect = _mock_post_down
+        http_inst.get.return_value = empty_web_resp
+
+        degraded_snap = market_collector.get_snapshot("TCELL", include_news=False)
+        degraded_cons = analyst_collector.get_consensus("TCELL")
+
+    assert degraded_snap.current_price == 97.0
+    assert degraded_snap.company_name == "Turkcell"
+    assert degraded_cons.avg_target_price == 0.0
+    assert ("TCELL", False) not in market_collector._snapshot_cache
+    assert "TCELL" not in analyst_collector._consensus_cache
+
+    # 2) TradingView Scanner normale döndüğünde, önbellek kirlenmediği için hemen dolu veri dönmeli
+    ok_tv_resp = MagicMock(status_code=200)
+    ok_tv_resp.json.return_value = tv_payload
+
+    clear_tv_scanner_cache()
+    with patch("httpx.Client") as mock_http_client, patch(
+        "src.collectors.market_collector.yf.Ticker", side_effect=RuntimeError("Yahoo 429")
+    ), patch(
+        "src.collectors.analyst_collector.yf.Ticker", side_effect=RuntimeError("Yahoo 429")
+    ):
+        http_inst = mock_http_client.return_value.__enter__.return_value
+        http_inst.post.return_value = ok_tv_resp
+        http_inst.get.return_value = empty_web_resp
+
+        opps = analyst_collector.scan_opportunities(universe=["TCELL", "TUPRS"], limit=5)
+        golden = get_golden_stocks(
+            analyst_collector=analyst_collector,
+            market_collector=market_collector,
+            universe=["TCELL", "TUPRS"],
+            limit=5,
+        )
+        divs = get_dividend_leaders(
+            market_collector=market_collector,
+            analyst_collector=analyst_collector,
+            universe=["TCELL", "TUPRS"],
+            limit=5,
+        )
+
+    assert len(opps) == 1
+    assert opps[0].symbol == "TCELL"
+    assert opps[0].buy_count == 8
+    assert opps[0].avg_target_price == 152.83
+    assert opps[0].upside_percent > 55.0
+
+    assert [g["symbol"] for g in golden] == ["TCELL", "TUPRS"]
+    assert golden[0]["market"].company_name == "Turkcell"
+    assert [d["symbol"] for d in divs] == ["TUPRS", "TCELL"]
+    assert divs[0]["dividend_yield_pct"] == 4.77
+    assert divs[1]["dividend_yield_pct"] == 3.75
+    assert ("TCELL", False) in market_collector._snapshot_cache
+    assert "TCELL" in analyst_collector._consensus_cache
+
+    clear_tv_scanner_cache()
+
+
+def test_portfolio_persistence_initial_and_github_sync(tmp_path: Path) -> None:
+    """INITIAL_PORTFOLIO yüklemesi, /yedek biçimlendirmesi ve GitHub Contents API yedek/geri yüklemeyi doğrular."""
+    import base64
+
+    # 1) Ayrıştırma ve round-trip biçimlendirme
+    parsed = parse_initial_portfolio_string("THYAO:100:285, TUPRS:50:162.5, ASELS; ekgyo.is 10 12,5")
+    assert parsed == [
+        {"symbol": "THYAO", "lot": 100.0, "avg_cost": 285.0},
+        {"symbol": "TUPRS", "lot": 50.0, "avg_cost": 162.5},
+        {"symbol": "ASELS", "lot": 0.0, "avg_cost": 0.0},
+        {"symbol": "EKGYO", "lot": 10.0, "avg_cost": 12.5},
+    ]
+
+    seed_only_db = DatabaseManager(
+        tmp_path / "seed_only.db",
+        initial_portfolio="THYAO:100:285,ASELS",
+    )
+    seed_items = seed_only_db.list_portfolio_items()
+    assert [i.symbol for i in seed_items] == ["THYAO", "ASELS"]
+    assert seed_items[0].lot == 100.0 and seed_items[0].avg_cost == 285.0
+    assert seed_items[1].is_owned is False
+    assert format_portfolio_env_string(seed_items) == "THYAO:100:285,ASELS"
+
+    # 2) GitHub Contents API üzerinden ilk seed -> PUT -> yeni DB'de GET restore
+    stored_blob: dict[str, str] = {"content": "", "sha": ""}
+
+    def _fake_get(url: str, headers: dict | None = None):
+        resp = MagicMock()
+        if not stored_blob["content"]:
+            resp.status_code = 404
+            return resp
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"sha": stored_blob["sha"], "content": stored_blob["content"]}
+        return resp
+
+    def _fake_put(url: str, headers: dict | None = None, json: dict | None = None):
+        assert json is not None
+        assert "[skip ci]" in json["message"]
+        stored_blob["content"] = json["content"]
+        stored_blob["sha"] = "sha_updated_123"
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"content": {"sha": stored_blob["sha"]}}
+        return resp
+
+    with patch("src.storage.db.httpx.Client") as mock_gh_client:
+        client_inst = mock_gh_client.return_value.__enter__.return_value
+        client_inst.get.side_effect = _fake_get
+        client_inst.put.side_effect = _fake_put
+
+        gh_db = DatabaseManager.from_settings(
+            Settings(
+                db_path=tmp_path / "gh_primary.db",
+                initial_portfolio="THYAO:100:285",
+                github_token="ghp_test_token_value",
+                github_repo="enisotag/borsa-ajani",
+            )
+        )
+        assert [i.symbol for i in gh_db.list_portfolio_items()] == ["THYAO"]
+        assert stored_blob["content"] != ""
+
+        # Değişiklik yapılınca (ekle/cikar) GitHub yedeği güncellenmeli
+        gh_db.upsert_portfolio_item("TUPRS", lot=40, avg_cost=350.0)
+        decoded = json.loads(base64.b64decode(stored_blob["content"]).decode("utf-8"))
+        assert decoded["env_string"] == "THYAO:100:285,TUPRS:40:350"
+        assert gh_db.remove_portfolio_item("THYAO") is True
+
+        # Boş yerel DB'de (yeni Render deploy simülasyonu) GitHub'daki son canlı durum (TUPRS) geri gelmeli
+        restored_db = DatabaseManager.from_settings(
+            Settings(
+                db_path=tmp_path / "gh_restored.db",
+                initial_portfolio="THYAO:100:285",
+                github_token="ghp_test_token_value",
+                github_repo="enisotag/borsa-ajani",
+            )
+        )
+        restored_items = restored_db.list_portfolio_items()
+        assert [i.symbol for i in restored_items] == ["TUPRS"]
+        assert restored_items[0].lot == 40.0 and restored_items[0].avg_cost == 350.0

@@ -6,19 +6,103 @@ import logging
 import math
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import feedparser
 import httpx
 import yfinance as yf
 from tradingview_ta import Interval, TA_Handler
+from tradingview_ta.technicals import Compute
 
 from src.storage.models import MarketSnapshot
 
 from .sector_collector import get_sector_and_peers
 
 logger = logging.getLogger(__name__)
+
+_TV_SCANNER_URL = "https://scanner.tradingview.com/turkey/scan"
+_TV_SCANNER_COLUMNS: tuple[str, ...] = (
+    "name",
+    "description",
+    "close",
+    "change",
+    "sector",
+    "price_earnings_ttm",
+    "price_book_ratio",
+    "price_book_fq",
+    "price_52_week_high",
+    "price_52_week_low",
+    "dividends_yield_current",
+    "dps_common_stock_prim_issue_fy",
+    "Recommend.All",
+    "RSI",
+    "price_target_average",
+    "price_target_high",
+    "price_target_low",
+    "recommendation_buy",
+    "recommendation_over",
+    "recommendation_hold",
+    "recommendation_sell",
+    "recommendation_under",
+    "recommendation_total",
+)
+
+_BIST_COMPANY_NAMES: dict[str, str] = {
+    "THYAO": "Türk Hava Yolları",
+    "TUPRS": "Tüpraş",
+    "ASELS": "Aselsan",
+    "EREGL": "Erdemir",
+    "BIMAS": "BİM Mağazalar",
+    "SISE": "Şişecam",
+    "AKBNK": "Akbank",
+    "GARAN": "Garanti BBVA",
+    "ISCTR": "İş Bankası (C)",
+    "YKBNK": "Yapı Kredi",
+    "KCHOL": "Koç Holding",
+    "SAHOL": "Sabancı Holding",
+    "FROTO": "Ford Otosan",
+    "TOASO": "Tofaş Oto",
+    "TCELL": "Turkcell",
+    "TTKOM": "Türk Telekom",
+    "PETKM": "Petkim",
+    "HEKTS": "Hektaş",
+    "SASA": "Sasa Polyester",
+    "ENKAI": "Enka İnşaat",
+    "ARCLK": "Arçelik",
+    "MGROS": "Migros",
+    "PGSUS": "Pegasus",
+    "KOZAL": "Koza Altın",
+    "KRDMD": "Kardemir (D)",
+    "ASTOR": "Astor Enerji",
+    "KONTR": "Kontrolmatik",
+    "TAVHL": "TAV Havalimanları",
+    "ALARK": "Alarko Holding",
+    "VESTL": "Vestel",
+    "DOAS": "Doğuş Otomotiv",
+    "ULKER": "Ülker Bisküvi",
+    "CCOLA": "Coca-Cola İçecek",
+    "AEFES": "Anadolu Efes",
+    "EKGYO": "Emlak Konut GYO",
+    "OYAKC": "Oyak Çimento",
+    "CIMSA": "Çimsa",
+    "MAVI": "Mavi Giyim",
+    "AGHOL": "Anadolu Grubu Holding",
+    "SOKM": "Şok Marketler",
+    "CLEBI": "Çelebi Hava Servisi",
+    "VAKBN": "VakıfBank",
+    "HALKB": "Halkbank",
+    "TSKB": "TSKB",
+    "DOHOL": "Doğan Holding",
+    "TTRAK": "Türk Traktör",
+    "OTKAR": "Otokar",
+    "ENJSA": "Enerjisa",
+    "AKSEN": "Aksa Enerji",
+    "SDTTR": "SDT Uzay",
+    "MIATK": "Mia Teknoloji",
+    "ISDMR": "İskenderun Demir Çelik",
+    "VESBE": "Vestel Beyaz Eşya",
+}
 
 _YF_SECTOR_TR_MAP: dict[str, str] = {
     "Industrials": "Sanayi",
@@ -32,7 +116,109 @@ _YF_SECTOR_TR_MAP: dict[str, str] = {
     "Real Estate": "GYO & İnşaat",
     "Utilities": "Enerji & Altyapı",
     "Healthcare": "Sağlık",
+    "Transportation": "Ulaştırma",
+    "Communications": "Telekomünikasyon",
+    "Energy Minerals": "Enerji",
+    "Finance": "Finans & Bankacılık",
+    "Retail Trade": "Perakende & Ticaret",
+    "Process Industries": "Sanayi & Kimya",
+    "Non-Energy Minerals": "Maden & Çimento",
+    "Consumer Non-Durables": "Gıda & Tüketim",
+    "Consumer Durables": "Dayanıklı Tüketim & Otomotiv",
+    "Producer Manufacturing": "Üretim & Sanayi",
+    "Electronic Technology": "Teknoloji & Savunma",
 }
+
+_TV_SCANNER_LOCK = threading.Lock()
+_TV_SCANNER_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def clear_tv_scanner_cache() -> None:
+    """Paylaşılan TradingView tarayıcı önbelleğini temizler."""
+    with _TV_SCANNER_LOCK:
+        _TV_SCANNER_CACHE.clear()
+
+
+def fetch_tradingview_scanner_data(
+    symbols: list[str],
+    timeout_seconds: float = 8.0,
+    cache_ttl_seconds: float = 300.0,
+) -> dict[str, dict[str, Any]]:
+    """TradingView Turkey Scanner üzerinden toplu BIST fiyat, temel ve analist verisi çeker."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for sym in symbols:
+        norm = str(sym).strip().upper().replace(".IS", "")
+        if norm and norm not in seen:
+            seen.add(norm)
+            cleaned.append(norm)
+
+    if not cleaned:
+        return {}
+
+    now_ts = time.monotonic()
+    results: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+
+    if cache_ttl_seconds > 0:
+        with _TV_SCANNER_LOCK:
+            for sym in cleaned:
+                cached = _TV_SCANNER_CACHE.get(sym)
+                if cached and (now_ts - cached[0]) < cache_ttl_seconds:
+                    results[sym] = cached[1]
+                else:
+                    missing.append(sym)
+    else:
+        missing = list(cleaned)
+
+    if missing:
+        payload = {
+            "symbols": {"tickers": [f"BIST:{s}" for s in missing]},
+            "columns": list(_TV_SCANNER_COLUMNS),
+        }
+        try:
+            with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+                resp = client.post(
+                    _TV_SCANNER_URL,
+                    json=payload,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; BorsaAjani/1.0)"},
+                )
+            if resp.status_code == 200:
+                rows = resp.json().get("data", [])
+                fetched_at = time.monotonic()
+                new_entries: dict[str, dict[str, Any]] = {}
+                for row in rows:
+                    raw_ticker = str(row.get("s") or "")
+                    sym = raw_ticker.split(":")[-1].strip().upper()
+                    values = row.get("d")
+                    if sym and isinstance(values, list) and len(values) == len(_TV_SCANNER_COLUMNS):
+                        entry = dict(zip(_TV_SCANNER_COLUMNS, values))
+                        new_entries[sym] = entry
+                        results[sym] = entry
+                if cache_ttl_seconds > 0 and new_entries:
+                    with _TV_SCANNER_LOCK:
+                        for sym, entry in new_entries.items():
+                            _TV_SCANNER_CACHE[sym] = (fetched_at, entry)
+        except Exception as exc:
+            logger.debug("TradingView toplu tarama verisi alınamadı: %s", exc)
+
+    return results
+
+
+def get_tv_scanner_row(
+    symbol: str,
+    timeout_seconds: float = 8.0,
+    cache_ttl_seconds: float = 300.0,
+) -> Optional[dict[str, Any]]:
+    """Tek bir BIST hissesi için önbellekli TradingView Scanner satırını döner."""
+    norm = str(symbol).strip().upper().replace(".IS", "")
+    if not norm:
+        return None
+    return fetch_tradingview_scanner_data(
+        [norm],
+        timeout_seconds=timeout_seconds,
+        cache_ttl_seconds=cache_ttl_seconds,
+    ).get(norm)
 
 _TV_RECOMMENDATION_MAP: dict[str, str] = {
     "STRONG_BUY": "GÜÇLÜ AL",
@@ -240,6 +426,37 @@ class MarketCollector:
             logger.debug("TradingView verisi alınamadı (%s): %s", symbol, exc)
             return "BİLİNMİYOR", 0, 0, 0, None
 
+    @staticmethod
+    def _parse_finite_float(value: object) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            num = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    def prefetch_fundamentals(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """Verilen BIST hisseleri için TradingView Scanner verilerini tek istekte önbelleğe alır."""
+        return fetch_tradingview_scanner_data(
+            symbols,
+            timeout_seconds=self.timeout_seconds,
+            cache_ttl_seconds=min(300.0, self.cache_ttl_seconds),
+        )
+
+    @classmethod
+    def _resolve_company_name(
+        cls,
+        clean_symbol: str,
+        yf_name: Optional[str] = None,
+        tv_description: Optional[str] = None,
+    ) -> str:
+        for candidate in (yf_name, tv_description):
+            cleaned = str(candidate or "").strip()
+            if cleaned and cleaned.upper() != clean_symbol:
+                return cleaned
+        return _BIST_COMPANY_NAMES.get(clean_symbol, clean_symbol)
+
     def fetch_recent_news(
         self, symbol: str, company_name: str = "", limit: int = 4
     ) -> list[str]:
@@ -281,9 +498,43 @@ class MarketCollector:
 
         yf_symbol = f"{clean_symbol}.IS"
 
+        tv_row = get_tv_scanner_row(
+            clean_symbol,
+            timeout_seconds=self.timeout_seconds,
+            cache_ttl_seconds=min(300.0, self.cache_ttl_seconds),
+        )
+        tv_price = self._parse_positive_float(tv_row.get("close")) if tv_row else None
+        tv_change = self._parse_finite_float(tv_row.get("change")) if tv_row else None
+        tv_desc = str(tv_row.get("description") or "").strip() if tv_row else ""
+        tv_pe = self._parse_positive_float(tv_row.get("price_earnings_ttm")) if tv_row else None
+        tv_pb = (
+            self._parse_positive_float(tv_row.get("price_book_ratio"))
+            or self._parse_positive_float(tv_row.get("price_book_fq"))
+            if tv_row
+            else None
+        )
+        tv_h52 = self._parse_positive_float(tv_row.get("price_52_week_high")) if tv_row else None
+        tv_l52 = self._parse_positive_float(tv_row.get("price_52_week_low")) if tv_row else None
+        tv_div_yield = (
+            self._parse_positive_float(tv_row.get("dividends_yield_current")) if tv_row else None
+        )
+        tv_last_div = (
+            self._parse_positive_float(tv_row.get("dps_common_stock_prim_issue_fy"))
+            if tv_row
+            else None
+        )
+        tv_sector = str(tv_row.get("sector") or "").strip() if tv_row else ""
+        tv_rsi = self._parse_positive_float(tv_row.get("RSI")) if tv_row else None
+        tv_rec_all = self._parse_finite_float(tv_row.get("Recommend.All")) if tv_row else None
+
+        has_tv_fundamentals = any(
+            v is not None for v in (tv_pe, tv_pb, tv_h52, tv_div_yield)
+        )
+        should_query_yf = include_news or tv_price is None or not has_tv_fundamentals
+
         current_price = 0.0
         daily_change_pct = 0.0
-        company_name = clean_symbol
+        yf_company_name: Optional[str] = None
         pe_ratio: Optional[float] = None
         pb_ratio: Optional[float] = None
         high_52w: Optional[float] = None
@@ -293,77 +544,124 @@ class MarketCollector:
         yf_sector: Optional[str] = None
         closes: list[float] = []
 
-        try:
-            ticker = yf.Ticker(yf_symbol)
-            hist = ticker.history(period="3mo")
-            if not hist.empty and "Close" in hist.columns:
-                closes = [float(x) for x in hist["Close"].dropna().tolist()]
-                if closes:
-                    current_price = round(closes[-1], 2)
-                if len(closes) >= 2 and closes[-2] > 0:
-                    daily_change_pct = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
-
-            info: dict = {}
+        if should_query_yf:
             try:
-                info = ticker.info or {}
-            except Exception as info_exc:
-                logger.debug("yfinance info okunamadı (%s): %s", yf_symbol, info_exc)
+                ticker = yf.Ticker(yf_symbol)
+                hist = ticker.history(period="3mo")
+                if not hist.empty and "Close" in hist.columns:
+                    closes = [float(x) for x in hist["Close"].dropna().tolist()]
+                    if closes:
+                        current_price = round(closes[-1], 2)
+                    if len(closes) >= 2 and closes[-2] > 0:
+                        daily_change_pct = round(
+                            ((closes[-1] - closes[-2]) / closes[-2]) * 100, 2
+                        )
 
-            if current_price <= 0:
-                fast = getattr(ticker, "fast_info", None)
-                if fast:
-                    last_p = fast.get("last_price") or fast.get("lastPrice")
-                    prev_p = fast.get("previous_close") or fast.get("previousClose")
-                    if last_p:
-                        current_price = round(float(last_p), 2)
-                    if last_p and prev_p and float(prev_p) > 0:
-                        daily_change_pct = round(((float(last_p) - float(prev_p)) / float(prev_p)) * 100, 2)
+                info: dict = {}
+                try:
+                    info = ticker.info or {}
+                except Exception as info_exc:
+                    logger.debug("yfinance info okunamadı (%s): %s", yf_symbol, info_exc)
 
-            company_name = str(
-                info.get("shortName") or info.get("longName") or clean_symbol
-            ).strip()
+                if current_price <= 0:
+                    fast = getattr(ticker, "fast_info", None)
+                    if fast:
+                        last_p = fast.get("last_price") or fast.get("lastPrice")
+                        prev_p = fast.get("previous_close") or fast.get("previousClose")
+                        if last_p:
+                            current_price = round(float(last_p), 2)
+                        if last_p and prev_p and float(prev_p) > 0:
+                            daily_change_pct = round(
+                                ((float(last_p) - float(prev_p)) / float(prev_p)) * 100, 2
+                            )
 
-            raw_pe = info.get("trailingPE") or info.get("forwardPE")
-            if raw_pe and float(raw_pe) > 0:
-                pe_ratio = round(float(raw_pe), 2)
+                yf_company_name = str(
+                    info.get("shortName") or info.get("longName") or ""
+                ).strip() or None
 
-            raw_pb = info.get("priceToBook")
-            if raw_pb and float(raw_pb) > 0:
-                pb_ratio = round(float(raw_pb), 2)
+                raw_pe = info.get("trailingPE") or info.get("forwardPE")
+                if raw_pe and float(raw_pe) > 0:
+                    pe_ratio = round(float(raw_pe), 2)
 
-            raw_h52 = info.get("fiftyTwoWeekHigh")
-            raw_l52 = info.get("fiftyTwoWeekLow")
-            if raw_h52 and float(raw_h52) > 0:
-                high_52w = round(float(raw_h52), 2)
-            if raw_l52 and float(raw_l52) > 0:
-                low_52w = round(float(raw_l52), 2)
+                raw_pb = info.get("priceToBook")
+                if raw_pb and float(raw_pb) > 0:
+                    pb_ratio = round(float(raw_pb), 2)
 
-            raw_div_yield = self._parse_positive_float(info.get("dividendYield"))
-            if raw_div_yield is None:
-                raw_div_yield = self._parse_positive_float(info.get("trailingAnnualDividendYield"))
-            if raw_div_yield is not None:
-                normalized_div = raw_div_yield * 100.0 if 0 < raw_div_yield < 1 else raw_div_yield
-                dividend_yield_pct = round(normalized_div, 2)
+                raw_h52 = info.get("fiftyTwoWeekHigh")
+                raw_l52 = info.get("fiftyTwoWeekLow")
+                if raw_h52 and float(raw_h52) > 0:
+                    high_52w = round(float(raw_h52), 2)
+                if raw_l52 and float(raw_l52) > 0:
+                    low_52w = round(float(raw_l52), 2)
 
-            raw_last_div = self._parse_positive_float(info.get("lastDividendValue"))
-            if raw_last_div is not None:
-                last_dividend_value = (
-                    round(raw_last_div, 2) if raw_last_div >= 0.01 else round(raw_last_div, 4)
-                )
+                raw_div_yield = self._parse_positive_float(info.get("dividendYield"))
+                if raw_div_yield is None:
+                    raw_div_yield = self._parse_positive_float(
+                        info.get("trailingAnnualDividendYield")
+                    )
+                if raw_div_yield is not None:
+                    normalized_div = (
+                        raw_div_yield * 100.0 if 0 < raw_div_yield < 1 else raw_div_yield
+                    )
+                    dividend_yield_pct = round(normalized_div, 2)
 
-            raw_sector = info.get("sector")
-            if isinstance(raw_sector, str) and raw_sector.strip():
-                yf_sector = raw_sector.strip()
-        except Exception as exc:
-            logger.warning("Yahoo Finance piyasa verisi çekilemedi (%s): %s", yf_symbol, exc)
+                raw_last_div = self._parse_positive_float(info.get("lastDividendValue"))
+                if raw_last_div is not None:
+                    last_dividend_value = (
+                        round(raw_last_div, 2)
+                        if raw_last_div >= 0.01
+                        else round(raw_last_div, 4)
+                    )
 
+                raw_sector = info.get("sector")
+                if isinstance(raw_sector, str) and raw_sector.strip():
+                    yf_sector = raw_sector.strip()
+            except Exception as exc:
+                logger.warning("Yahoo Finance piyasa verisi çekilemedi (%s): %s", yf_symbol, exc)
+
+        # TradingView Scanner yedek/birincil zenginleştirmesi (özellikle Yahoo 429 durumlarında)
+        if current_price <= 0 and tv_price is not None:
+            current_price = round(tv_price, 2)
+        if daily_change_pct == 0.0 and tv_change is not None:
+            daily_change_pct = round(tv_change, 2)
+        if pe_ratio is None and tv_pe is not None:
+            pe_ratio = round(tv_pe, 2)
+        if pb_ratio is None and tv_pb is not None:
+            pb_ratio = round(tv_pb, 2)
+        if high_52w is None and tv_h52 is not None:
+            high_52w = round(tv_h52, 2)
+        if low_52w is None and tv_l52 is not None:
+            low_52w = round(tv_l52, 2)
+        if dividend_yield_pct is None and tv_div_yield is not None:
+            dividend_yield_pct = round(tv_div_yield, 2)
+        if last_dividend_value is None and tv_last_div is not None:
+            last_dividend_value = (
+                round(tv_last_div, 2) if tv_last_div >= 0.01 else round(tv_last_div, 4)
+            )
+        if not yf_sector and tv_sector:
+            yf_sector = tv_sector
+
+        company_name = self._resolve_company_name(
+            clean_symbol, yf_name=yf_company_name, tv_description=tv_desc
+        )
         sector_tr = self._resolve_sector_tr(clean_symbol, yf_sector)
 
         drawdown_pct: Optional[float] = None
         if current_price > 0 and high_52w and high_52w > 0:
             drawdown_pct = round(((current_price - high_52w) / high_52w) * 100, 2)
 
-        tv_rec, tv_buy, tv_neutral, tv_sell, rsi = self._fetch_tradingview_summary(clean_symbol)
+        if not include_news and tv_rec_all is not None and -1.0 <= tv_rec_all <= 1.0:
+            computed = Compute.Recommend(tv_rec_all)
+            tv_rec = _TV_RECOMMENDATION_MAP.get(computed, "NÖTR")
+            tv_buy, tv_neutral, tv_sell = 0, 0, 0
+            rsi = round(tv_rsi, 2) if tv_rsi is not None else None
+        else:
+            tv_rec, tv_buy, tv_neutral, tv_sell, rsi = self._fetch_tradingview_summary(clean_symbol)
+            if tv_rec == "BİLİNMİYOR" and tv_rec_all is not None and -1.0 <= tv_rec_all <= 1.0:
+                computed = Compute.Recommend(tv_rec_all)
+                tv_rec = _TV_RECOMMENDATION_MAP.get(computed, "BİLİNMİYOR")
+            if rsi is None and tv_rsi is not None:
+                rsi = round(tv_rsi, 2)
 
         if rsi is None and closes:
             rsi = self._compute_rsi_from_closes(closes)
@@ -412,7 +710,10 @@ class MarketCollector:
             plain_valuation_comment=plain_val,
             recent_news=news,
         )
-        if current_price > 0:
+        has_fundamentals = any(
+            v is not None for v in (pe_ratio, pb_ratio, high_52w, dividend_yield_pct)
+        )
+        if current_price > 0 and has_fundamentals:
             with self._cache_lock:
                 self._snapshot_cache[(clean_symbol, include_news)] = (time.monotonic(), snapshot)
         return snapshot

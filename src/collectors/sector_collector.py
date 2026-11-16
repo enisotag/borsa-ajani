@@ -124,6 +124,20 @@ def get_sector_and_peers(symbol: str, max_peers: int = 3) -> tuple[str, list[str
     return "Genel BIST", fallback
 
 
+def _prefetch_fundamentals(
+    market_collector: MarketCollector, symbols: list[str]
+) -> None:
+    """Toplu tarama öncesinde MarketCollector önbelleğini tek TV Scanner isteğiyle ısıtır."""
+    if not symbols:
+        return
+    prefetch = getattr(market_collector, "prefetch_fundamentals", None)
+    if callable(prefetch):
+        try:
+            prefetch(symbols)
+        except Exception as exc:
+            logger.debug("Toplu temel veri önyüklemesi atlandı: %s", exc)
+
+
 def compare_stocks(
     symbols: list[str],
     market_collector: MarketCollector,
@@ -131,6 +145,7 @@ def compare_stocks(
 ) -> dict[str, Any]:
     """Verilen BIST hisselerini fiyat, çarpan, konsensüs ve teknik güç açısından karşılaştırır."""
     clean_symbols = _dedupe_symbols(symbols)
+    _prefetch_fundamentals(market_collector, clean_symbols)
     items: list[dict[str, Any]] = []
 
     def _fetch_one(sym: str) -> Optional[dict[str, Any]]:
@@ -210,6 +225,7 @@ def get_golden_stocks(
         return []
 
     target_universe = _resolve_universe(universe, analyst_collector)
+    _prefetch_fundamentals(market_collector, target_universe)
     scored: list[dict[str, Any]] = []
 
     def _score_one(sym: str) -> Optional[dict[str, Any]]:
@@ -239,7 +255,7 @@ def get_golden_stocks(
             return None
 
     if target_universe:
-        with ThreadPoolExecutor(max_workers=min(8, len(target_universe))) as pool:
+        with ThreadPoolExecutor(max_workers=min(4, len(target_universe))) as pool:
             for item in pool.map(_score_one, target_universe):
                 if item is not None:
                     scored.append(item)
@@ -266,6 +282,7 @@ def get_dividend_leaders(
         return []
 
     target_universe = _resolve_universe(universe, analyst_collector)
+    _prefetch_fundamentals(market_collector, target_universe)
     candidates: list[tuple[str, MarketSnapshot]] = []
 
     def _fetch_div_snapshot(sym: str) -> Optional[tuple[str, MarketSnapshot]]:
@@ -278,7 +295,7 @@ def get_dividend_leaders(
         return None
 
     if target_universe:
-        with ThreadPoolExecutor(max_workers=min(8, len(target_universe))) as pool:
+        with ThreadPoolExecutor(max_workers=min(4, len(target_universe))) as pool:
             for pair in pool.map(_fetch_div_snapshot, target_universe):
                 if pair is not None:
                     candidates.append(pair)
@@ -314,7 +331,7 @@ def get_dividend_leaders(
     if not top_candidates:
         return []
 
-    with ThreadPoolExecutor(max_workers=min(6, len(top_candidates))) as pool:
+    with ThreadPoolExecutor(max_workers=min(4, len(top_candidates))) as pool:
         return list(pool.map(_enrich_dividend, top_candidates))
 
 

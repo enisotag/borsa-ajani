@@ -65,7 +65,7 @@ def run_test_stock(
     settings: Settings,
 ) -> int:
     """Seçilen tek hisse için canlı veri çekip AI/şablon yorumunu konsola basar."""
-    db = DatabaseManager(settings.db_path)
+    db = DatabaseManager.from_settings(settings)
     market_collector = MarketCollector()
     analyst_collector = AnalystCollector(settings=settings)
     commentator = BorsaCommentator(settings=settings)
@@ -85,7 +85,7 @@ def run_test_stock(
 
 def run_once_summary(dry_run: bool, settings: Settings) -> int:
     """Günlük özet bültenini tek seferlik çalıştırır."""
-    db = DatabaseManager(settings.db_path)
+    db = DatabaseManager.from_settings(settings)
     market_collector = MarketCollector()
     analyst_collector = AnalystCollector(settings=settings)
     commentator = BorsaCommentator(settings=settings)
@@ -107,7 +107,7 @@ def run_once_summary(dry_run: bool, settings: Settings) -> int:
 
 def run_once_scan(dry_run: bool, settings: Settings) -> int:
     """Yeni analist raporlarını ve BIST fırsatlarını tek seferlik tarar."""
-    db = DatabaseManager(settings.db_path)
+    db = DatabaseManager.from_settings(settings)
     market_collector = MarketCollector()
     analyst_collector = AnalystCollector(settings=settings)
 

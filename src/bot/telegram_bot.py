@@ -41,7 +41,7 @@ from src.scheduler.jobs import (
     intraday_report_scan_job,
     send_telegram_text,
 )
-from src.storage.db import DatabaseManager
+from src.storage.db import DatabaseManager, format_portfolio_env_string
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ _NON_TICKER_WORDS = {
     "KERE", "DEFA", "FARK", "ARTI", "EKSI", "EKSİ", "KAZAN", "KAYIP", "SABIR",
     "UZMAN", "HEMEN", "AYRI", "TOPLU", "BASIT", "BASİT", "ACIK", "AÇIK", "OLAN",
     "EDEN", "ALAN", "SATAN", "YAPAN", "BAKAN", "SORAN", "VEREN", "GELEN", "GIDEN",
-    "KALAN", "YATIR", "VARMI", "YOKMU", "BIRAZ", "COGU",
+    "KALAN", "YATIR", "VARMI", "YOKMU", "BIRAZ", "COGU", "YEDEK",
 }
 
 _QUESTION_PATTERN = re.compile(
@@ -254,7 +254,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/temettu` → En yüksek temettü verimine sahip BIST liderleri\n"
         "• `/kiyasla THYAO PGSUS` → Seçtiğin hisseleri yan yana kıyaslar ve yorumlar\n"
         "• `/raporlar` → Son aracı kurum hedef fiyat raporlarını listeler\n"
-        "• `/ozet` → Günlük özet bültenini hemen hazırlar (otomatik: 09:30 & 18:30)"
+        "• `/ozet` → Günlük özet bültenini hemen hazırlar (otomatik: 09:30 & 18:30)\n"
+        "• `/yedek` → Portföyün için Render `INITIAL_PORTFOLIO` satırını ve GitHub yedek durumunu gösterir"
     )
     await send_telegram_text(
         context.bot, chat_id, welcome_text, reply_markup=_main_menu_keyboard()
@@ -341,7 +342,9 @@ async def cmd_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    item = db.upsert_portfolio_item(symbol=symbol, lot=lot, avg_cost=avg_cost)
+    item = await asyncio.to_thread(
+        db.upsert_portfolio_item, symbol=symbol, lot=lot, avg_cost=avg_cost
+    )
     if item.is_owned:
         msg = (
             f"✅ **{item.symbol}** portföyüne kaydedildi.\n"
@@ -366,11 +369,54 @@ async def cmd_cikar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     _, db, _, _, _ = _get_deps(context)
     symbol = MarketCollector.normalize_bist_symbol(context.args[0])
-    removed = db.remove_portfolio_item(symbol)
+    removed = await asyncio.to_thread(db.remove_portfolio_item, symbol)
     if removed:
         await update.effective_message.reply_text(f"🗑️ {symbol} portföy/izleme listenden çıkarıldı.")
     else:
         await update.effective_message.reply_text(f"ℹ️ {symbol} zaten listende kayıtlı değil.")
+
+
+async def cmd_yedek(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/yedek` komutuyla portföy yedeğini (`INITIAL_PORTFOLIO`) ve GitHub senkron durumunu gösterir."""
+    if not update.effective_chat:
+        return
+    _, db, _, _, _ = _get_deps(context)
+    items = db.list_portfolio_items()
+    env_string = format_portfolio_env_string(items)
+
+    lines = ["💾 **Portföy Kalıcılık & Yedek Durumu**\n"]
+    if db.has_github_sync:
+        synced_ok = await asyncio.to_thread(db._sync_to_github)
+        if synced_ok:
+            lines.append(
+                f"• **GitHub Otomatik Yedek:** ✅ Aktif ve güncel (`{db.github_repo}` → `{db.github_portfolio_path}`)"
+            )
+        else:
+            err_detail = f" ({db.last_sync_error})" if db.last_sync_error else ""
+            lines.append(
+                f"• **GitHub Otomatik Yedek:** ⚠️ Bağlı ancak son yedeklemede hata alındı{err_detail}"
+            )
+    else:
+        lines.append(
+            "• **GitHub Otomatik Yedek:** ⚠️ Pasif (Render ortam değişkenlerine `GITHUB_TOKEN` eklenirse otomatik yedeklenir)"
+        )
+
+    if env_string:
+        lines.append(
+            "\n📋 **Render `INITIAL_PORTFOLIO` Yedeği** (Render → Environment kısmına kopyalayabilirsiniz):\n"
+            f"`INITIAL_PORTFOLIO={env_string}`"
+        )
+    else:
+        lines.append(
+            "\nℹ️ Portföyün şu an boş. Önce `/ekle THYAO 100 285` ile veya fotoğraf göndererek hisse ekleyebilirsin."
+        )
+
+    await send_telegram_text(
+        context.bot,
+        update.effective_chat.id,
+        "\n".join(lines),
+        reply_markup=_main_menu_keyboard(),
+    )
 
 
 async def _send_portfolio_summary(
@@ -385,7 +431,8 @@ async def _send_portfolio_summary(
             "💼 Portföyün ve izleme listen şu an boş.\n\n"
             "Eklemek için:\n"
             "• `/ekle THYAO 100 285` (Maliyetli portföy)\n"
-            "• `/ekle TUPRS` (Sadece izleme)",
+            "• `/ekle TUPRS` (Sadece izleme)\n"
+            "• Kalıcı yedek bilgisi için: `/yedek`",
         )
         return
 
@@ -1006,12 +1053,12 @@ async def handle_callback_query(
     elif action == "compare_sector" and payload:
         await _send_sector_comparison(context, chat_id, payload)
     elif action == "watch" and payload:
-        db.upsert_portfolio_item(payload, lot=0.0, avg_cost=0.0)
+        await asyncio.to_thread(db.upsert_portfolio_item, payload, 0.0, 0.0)
         await send_telegram_text(
             context.bot, chat_id, f"✅ **{payload}** izleme listene eklendi."
         )
     elif action == "unwatch" and payload:
-        db.remove_portfolio_item(payload)
+        await asyncio.to_thread(db.remove_portfolio_item, payload)
         await send_telegram_text(
             context.bot, chat_id, f"🗑️ **{payload}** listenden çıkarıldı."
         )
@@ -1045,7 +1092,7 @@ async def handle_callback_query(
                 reply_markup=_main_menu_keyboard(),
             )
             return
-        saved_items = db.bulk_upsert_portfolio(pending_items)
+        saved_items = await asyncio.to_thread(db.bulk_upsert_portfolio, pending_items)
         if not saved_items:
             await send_telegram_text(
                 context.bot,
@@ -1321,7 +1368,7 @@ def build_application(settings: Optional[Settings] = None) -> Application:
             "Geçerli bir TELEGRAM_BOT_TOKEN bulunamadı. Lütfen .env dosyasını kontrol edin."
         )
 
-    db = DatabaseManager(active_settings.db_path)
+    db = DatabaseManager.from_settings(active_settings)
     market_collector = MarketCollector()
     analyst_collector = AnalystCollector(settings=active_settings)
     commentator = BorsaCommentator(settings=active_settings)
@@ -1344,6 +1391,7 @@ def build_application(settings: Optional[Settings] = None) -> Application:
     app.add_handler(CommandHandler("kiyasla", cmd_kiyasla))
     app.add_handler(CommandHandler("raporlar", cmd_raporlar))
     app.add_handler(CommandHandler("ozet", cmd_ozet))
+    app.add_handler(CommandHandler("yedek", cmd_yedek))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))

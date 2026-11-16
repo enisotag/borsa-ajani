@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -16,6 +17,8 @@ from bs4 import BeautifulSoup
 
 from src.config import Settings, get_settings
 from src.storage.models import AnalystConsensus, AnalystReport
+
+from .market_collector import fetch_tradingview_scanner_data, get_tv_scanner_row
 
 logger = logging.getLogger(__name__)
 
@@ -317,15 +320,102 @@ class AnalystCollector:
             reports,
         )
 
+    @staticmethod
+    def _to_pos_float(value: object) -> float:
+        if value is None or isinstance(value, bool):
+            return 0.0
+        try:
+            num = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+        return num if math.isfinite(num) and num > 0 else 0.0
+
+    @staticmethod
+    def _to_nonneg_int(value: object) -> int:
+        if value is None or isinstance(value, bool):
+            return 0
+        try:
+            num = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+        return int(num) if math.isfinite(num) and num > 0 else 0
+
+    def _fetch_tv_consensus_data(
+        self, symbol: str
+    ) -> tuple[float, float, float, float, int, int, int, int, list[AnalystReport]]:
+        """TradingView Turkey Scanner üzerinden analist konsensüsü ve hedef fiyat verisi çeker."""
+        clean_sym = self._normalize_symbol(symbol)
+        tv_row = get_tv_scanner_row(
+            clean_sym,
+            timeout_seconds=self.timeout_seconds,
+            cache_ttl_seconds=min(300.0, self.cache_ttl_seconds),
+        )
+        if not tv_row:
+            return 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, []
+
+        price = self._to_pos_float(tv_row.get("close"))
+        avg_tp = self._to_pos_float(tv_row.get("price_target_average"))
+        high_tp = self._to_pos_float(tv_row.get("price_target_high")) or avg_tp
+        low_tp = self._to_pos_float(tv_row.get("price_target_low")) or avg_tp
+        buy_count = self._to_nonneg_int(tv_row.get("recommendation_buy")) + self._to_nonneg_int(
+            tv_row.get("recommendation_over")
+        )
+        hold_count = self._to_nonneg_int(tv_row.get("recommendation_hold"))
+        sell_count = self._to_nonneg_int(
+            tv_row.get("recommendation_sell")
+        ) + self._to_nonneg_int(tv_row.get("recommendation_under"))
+        total_opinions = max(
+            self._to_nonneg_int(tv_row.get("recommendation_total")),
+            buy_count + hold_count + sell_count,
+        )
+
+        reports: list[AnalystReport] = []
+        if avg_tp > 0:
+            if buy_count >= hold_count and buy_count >= sell_count and buy_count > 0:
+                rec_label = "AL"
+            elif sell_count > buy_count and sell_count >= hold_count:
+                rec_label = "SAT"
+            else:
+                rec_label = "TUT"
+            upside = round(((avg_tp - price) / price) * 100, 2) if price > 0 else 0.0
+            reports.append(
+                AnalystReport(
+                    symbol=clean_sym,
+                    institution="Analist Konsensüsü (TradingView)",
+                    target_price=round(avg_tp, 2),
+                    current_price=round(price, 2) if price > 0 else None,
+                    upside_percent=upside,
+                    recommendation=rec_label,
+                    report_date=datetime.now().strftime("%Y-%m-%d"),
+                    source="TradingView Konsensüs",
+                )
+            )
+
+        return (
+            round(price, 2),
+            round(avg_tp, 2),
+            round(high_tp, 2),
+            round(low_tp, 2),
+            total_opinions,
+            buy_count,
+            hold_count,
+            sell_count,
+            reports,
+        )
+
     def get_consensus(
         self, symbol: str, current_price: Optional[float] = None
     ) -> AnalystConsensus:
-        """Yerel web tabloları ve Yahoo Finance verilerini birleştirerek analist konsensüsü döner."""
+        """TradingView, yerel web tabloları ve Yahoo Finance verilerini birleştirerek konsensüs döner."""
         clean_sym = self._normalize_symbol(symbol)
         now_ts = time.monotonic()
         with self._cache_lock:
             cached = self._consensus_cache.get(clean_sym)
-            if cached and (now_ts - cached[0]) < self.cache_ttl_seconds:
+            if (
+                cached
+                and (now_ts - cached[0]) < self.cache_ttl_seconds
+                and (cached[1].avg_target_price > 0 or cached[1].total_analysts > 0)
+            ):
                 cached_cons = cached[1]
                 if current_price and current_price > 0 and cached_cons.avg_target_price > 0:
                     new_upside = round(
@@ -341,19 +431,51 @@ class AnalystCollector:
                 return cached_cons
 
         (
-            yf_price,
-            avg_tp,
-            high_tp,
-            low_tp,
-            total_opinions,
-            buy_count,
-            hold_count,
-            sell_count,
-            yf_reports,
-        ) = self._fetch_yfinance_analyst_data(clean_sym, current_price=current_price)
+            tv_price,
+            tv_avg_tp,
+            tv_high_tp,
+            tv_low_tp,
+            tv_total,
+            tv_buy,
+            tv_hold,
+            tv_sell,
+            tv_reports,
+        ) = self._fetch_tv_consensus_data(clean_sym)
+
+        has_tv_consensus = tv_avg_tp > 0 and (tv_buy + tv_hold + tv_sell) > 0
+        if has_tv_consensus:
+            yf_price = 0.0
+            yf_avg_tp = 0.0
+            yf_high_tp = 0.0
+            yf_low_tp = 0.0
+            yf_total = 0
+            yf_buy = 0
+            yf_hold = 0
+            yf_sell = 0
+            yf_reports: list[AnalystReport] = []
+        else:
+            (
+                yf_price,
+                yf_avg_tp,
+                yf_high_tp,
+                yf_low_tp,
+                yf_total,
+                yf_buy,
+                yf_hold,
+                yf_sell,
+                yf_reports,
+            ) = self._fetch_yfinance_analyst_data(clean_sym, current_price=current_price)
 
         web_reports = self._fetch_web_target_reports(clean_sym)
-        price = current_price if (current_price and current_price > 0) else yf_price
+        price = current_price if (current_price and current_price > 0) else (tv_price or yf_price)
+
+        avg_tp = tv_avg_tp if tv_avg_tp > 0 else yf_avg_tp
+        high_tp = tv_high_tp if tv_high_tp > 0 else yf_high_tp
+        low_tp = tv_low_tp if tv_low_tp > 0 else yf_low_tp
+        if (tv_buy + tv_hold + tv_sell) > 0:
+            buy_count, hold_count, sell_count, total_opinions = tv_buy, tv_hold, tv_sell, tv_total
+        else:
+            buy_count, hold_count, sell_count, total_opinions = yf_buy, yf_hold, yf_sell, yf_total
 
         # Web raporlarının getiri potansiyelini güncel fiyatla güncelle
         enriched_web_reports: list[AnalystReport] = []
@@ -369,8 +491,19 @@ class AnalystCollector:
             )
 
         all_reports = enriched_web_reports + yf_reports
+        if not all_reports and tv_reports:
+            for rep in tv_reports:
+                upside = round(((rep.target_price - price) / price) * 100, 2) if price > 0 else 0.0
+                all_reports.append(
+                    rep.model_copy(
+                        update={
+                            "current_price": price if price > 0 else None,
+                            "upside_percent": upside,
+                        }
+                    )
+                )
 
-        # Eğer Yahoo Finance hedef ortalaması yoksa yerel web raporlarından hesapla
+        # Eğer harici konsensüs hedef ortalaması yoksa yerel web raporlarından hesapla
         if avg_tp <= 0 and enriched_web_reports:
             prices = [r.target_price for r in enriched_web_reports]
             avg_tp = round(sum(prices) / len(prices), 2)
@@ -403,7 +536,7 @@ class AnalystCollector:
             recent_reports=all_reports[:8],
             in_model_portfolios=in_model_portfolios,
         )
-        if consensus.current_price > 0 or consensus.avg_target_price > 0:
+        if consensus.avg_target_price > 0 or consensus.total_analysts > 0:
             with self._cache_lock:
                 self._consensus_cache[clean_sym] = (time.monotonic(), consensus)
         return consensus
@@ -431,7 +564,12 @@ class AnalystCollector:
             # Web kaynaklarından veri dönmezse ilk birkaç sembol için konsensüsten paralel topla
             collected: list[AnalystReport] = []
             sample_symbols = allowed[:10]
-            with ThreadPoolExecutor(max_workers=6) as pool:
+            fetch_tradingview_scanner_data(
+                sample_symbols,
+                timeout_seconds=self.timeout_seconds,
+                cache_ttl_seconds=min(300.0, self.cache_ttl_seconds),
+            )
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 for cons in pool.map(self.get_consensus, sample_symbols):
                     collected.extend(cons.recent_reports)
             return collected
@@ -466,8 +604,14 @@ class AnalystCollector:
         target_universe = [self._normalize_symbol(s) for s in (universe or self.settings.bist_universe)]
         owned_or_watched = {self._normalize_symbol(s) for s in (portfolio_symbols or set())}
 
+        fetch_tradingview_scanner_data(
+            target_universe,
+            timeout_seconds=self.timeout_seconds,
+            cache_ttl_seconds=min(300.0, self.cache_ttl_seconds),
+        )
+
         opportunities: list[AnalystConsensus] = []
-        max_workers = min(8, max(1, len(target_universe)))
+        max_workers = min(4, max(1, len(target_universe)))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             results = pool.map(
                 lambda sym: self._evaluate_opportunity(sym, owned_or_watched),
